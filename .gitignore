@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv
+venv/
+env/
+.geotraffic_venv
+
+# Pipeline download cache
+data/
+
+# Environment — commit .env.example, never .env
+.env
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Claude Code project memory
+.claude/
+
+# Node (unused)
+package.json
+package-lock.json
+node_modules/
+
+# Antigravity CLI
+.antigravitycli/

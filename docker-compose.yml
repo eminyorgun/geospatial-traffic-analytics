@@ -1,0 +1,61 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: geotraffic
+      POSTGRES_PASSWORD: geotraffic
+      POSTGRES_DB: traffic
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U geotraffic -d traffic"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  prefect-server:
+    image: prefecthq/prefect:3.7.2-python3.12
+    command: prefect server start --host 0.0.0.0
+    ports:
+      - "4200:4200"
+    environment:
+      PREFECT_UI_API_URL: http://localhost:4200/api
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  prefect-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      - DATABASE_URL=postgresql://geotraffic:geotraffic@db:5432/traffic
+      - PREFECT_API_URL=http://prefect-server:4200/api
+      - HPMS_STATE=${HPMS_STATE:-SC}
+      - HPMS_SAMPLE=${HPMS_SAMPLE:-5000}
+    depends_on:
+      db:
+        condition: service_healthy
+      prefect-server:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://geotraffic:geotraffic@db:5432/traffic
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
