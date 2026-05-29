@@ -1,6 +1,8 @@
 # Geospatial Traffic Analytics
 
-A Prefect-orchestrated data pipeline and FastAPI microservice for road network traffic volume analysis. Ingests standardized US federal road data, enriches it with readable road names, applies FHWA traffic adjustment factors to estimate hourly vehicle counts, and serves the results through a PostGIS-backed REST API.
+An ETL pipeline and geospatial REST API for road network traffic volume analysis. Ingests standardized US federal road data (HPMS GeoDatabase), enriches road segments with readable names via nearest-neighbor spatial join against Overture Maps, applies FHWA TVT adjustment factors to produce hourly vehicle count estimates, and serves the results through a PostGIS-backed REST API.
+
+Built with Prefect for pipeline orchestration, GeoPandas for geospatial transforms, GeoAlchemy2 + SQLAlchemy ORM for PostGIS persistence, and FastAPI + Pydantic for the serving layer.
 
 Built around standardized federal data. Swap two data files to run against any US state.
 
@@ -28,6 +30,7 @@ Built around standardized federal data. Swap two data files to run against any U
 │  │ PostgreSQL + PostGIS                                         │   │
 │  │                                                              │   │
 │  │  raw schema         staging schema      public schema        │   │
+│  │  (immutable)        (transformed)       (serving layer)      │   │
 │  │  ─────────────      ───────────────     ─────────────────    │   │
 │  │  hpms_roads         roads               roads                │   │
 │  │  overture_roads     volume_estimates    volume_estimates      │   │
@@ -398,7 +401,7 @@ If either data file is missing the pipeline stops immediately with a clear error
 
 **Stage 2: Validate** (`pipeline/tasks/validate.py`)
 
-Checks each source for basic correctness before any data is written. Runs three tasks in parallel:
+Validates each source against an explicit data contract before anything is written to the database. Runs three tasks in parallel:
 - `validate_hpms`: reads the state layer from the GDB, checks row count ≥ 1,000, required columns (`f_system`, `aadt`, `geometry`) are present, and CRS is defined
 - `validate_overture`: reads parquet metadata only (no rows loaded), checks row count ≥ 5,000 and required columns (`id`, `names`, `class`, `geometry`) are present
 - `validate_tvt_factors`: checks all four road class groups are present, each has exactly 24 hourly factors, and all values are positive
@@ -411,9 +414,9 @@ A failure in any validation task stops the pipeline before anything is written t
 
 Reads, cleans, and writes each source into the `raw` database schema. Runs three tasks in parallel:
 
-- `transform_hpms`: reads the state layer from the GDB in chunks of 10,000 rows. For each chunk: reprojects to EPSG:4326 if needed, renames columns to standard names, generates a unique `road_id` from `route_id + begin_point + end_point`, casts `county_id` float to string, converts geometries to MultiLineString, writes to `raw.hpms_roads`. If `HPMS_SAMPLE` is set, stops after that many rows.
+- `transform_hpms`: chunked ingestion from the GDB in batches of 10,000 rows. Per batch: CRS normalization to EPSG:4326, column mapping to standard names, composite `road_id` key generation (`route_id + begin_point + end_point`), float-to-string cast for county FIPS codes, geometry coercion to MultiLineString, write to `raw.hpms_roads`. Honors `HPMS_SAMPLE` for partial loads.
 
-- `transform_overture`: reads the parquet in chunks of 10,000 rows (4 columns only: `id`, `names`, `class`, `geometry`). For each chunk: decodes WKB geometry bytes to Shapely objects, extracts the primary road name from the `names` struct, renames columns, writes to `raw.overture_roads`.
+- `transform_overture`: chunked ingestion from GeoParquet in batches of 10,000 rows with column projection (4 columns only). Per batch: WKB decoding to Shapely geometry objects, primary name extraction from the nested `names` struct, column renaming, write to `raw.overture_roads`.
 
 - `transform_tvt`: expands the TVT constants into a flat table of 672 rows (4 factor groups × 24 hours × 7 days), writes to `raw.tvt_factors`.
 
@@ -421,7 +424,7 @@ Reads, cleans, and writes each source into the `raw` database schema. Runs three
 
 **Stage 4: Enrich** (`pipeline/tasks/transform.py`, `enrich_roads`)
 
-Reads all rows from `raw.hpms_roads` and `raw.overture_roads` into memory and performs a spatial join using `sjoin_nearest`. For each HPMS segment, the name of the closest Overture road segment is attached. Duplicates from equidistant matches are dropped, keeping the first. The result is written to `staging.roads`.
+Performs a nearest-neighbor spatial join (GeoPandas `sjoin_nearest`) between `raw.hpms_roads` and `raw.overture_roads` to enrich each HPMS segment with the name of its closest Overture counterpart. Duplicate matches from equidistant candidates are deduplicated. Result is written to `staging.roads`.
 
 ---
 
@@ -439,11 +442,12 @@ Factors come from `raw.tvt_factors` via the embedded constants. Roads are assign
 
 **Stage 6: Load** (`pipeline/tasks/load.py`)
 
-Promotes staging data to the public serving layer in a single transaction:
-1. Truncates `public.volume_estimates` and `public.roads` together (required by the foreign key constraint)
+Atomically promotes staging data to the public serving layer. The load is idempotent: existing data is always truncated before each run, so re-running produces a clean state with no duplicates.
+
+1. Truncates `public.volume_estimates` and `public.roads` in one statement (required to satisfy the FK constraint)
 2. Copies all rows from `staging.roads` → `public.roads`
 3. Copies all rows from `staging.volume_estimates` → `public.volume_estimates`
-4. Runs post-load validation: row counts must match staging, no null geometries, volume estimates must be non-zero
+4. Post-load validation: row counts must match staging, no null geometries, volume estimates must be non-zero
 
 ---
 
